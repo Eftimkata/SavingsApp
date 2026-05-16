@@ -12,7 +12,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
-        # ── v1.5 migration: add "notes" to old entries ──
+        # ── migrations ──
         changed = False
         for h in data.get("history", []):
             if "notes" not in h:
@@ -232,7 +232,6 @@ def main(page: ft.Page):
             expand=True,
         )
 
-        # ── Notes field (new in v1.5) ─────────────────────
         notes_field = ft.TextField(
             hint_text="Add a note (optional)...",
             border_color="#3D3D5C",
@@ -268,7 +267,6 @@ def main(page: ft.Page):
 
         feedback_text = ft.Text("", size=13, color="#7C6FFF")
 
-        # ── Refs ─────────────────────────────────────────
         progress_bar_ref = ft.Ref[ft.ProgressBar]()
         saved_text_ref = ft.Ref[ft.Text]()
         pct_text_ref = ft.Ref[ft.Text]()
@@ -276,7 +274,63 @@ def main(page: ft.Page):
         history_col_ref = ft.Ref[ft.Column]()
         emoji_ref = ft.Ref[ft.Text]()
 
-        # ── Notes dialog (view/edit on long press) ───────
+        # ── Delete entry ─────────────────────────────────
+        def delete_entry(entry_index, reverse_amount):
+            """Remove a history entry and reverse its effect on saved amount."""
+            entry = data["history"][entry_index]
+            amount_in_main_cur = entry["amount"]  # already stored in main currency
+
+            # Reverse the transaction's effect
+            if entry["action"] == "add":
+                data["saved"] = max(data["saved"] - amount_in_main_cur, 0)
+            else:
+                data["saved"] += amount_in_main_cur
+
+            data["history"].pop(entry_index)
+            save_data(data)
+            refresh_goal_ui()
+
+        def confirm_delete_entry(entry_index):
+            entry = data["history"][entry_index]
+            is_add = entry["action"] == "add"
+
+            def do_delete(ev):
+                dlg.open = False
+                page.update()
+                delete_entry(entry_index, entry["amount"])
+
+            def cancel(ev):
+                dlg.open = False
+                page.update()
+
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Delete this entry?", color="#FFFFFF"),
+                content=ft.Column([
+                    ft.Text(
+                        f"{'Added' if is_add else 'Removed'} {fmt(entry['amount'], entry['currency'])} on {entry['date']}",
+                        color="#9090B0", size=13,
+                    ),
+                    ft.Container(height=6),
+                    ft.Text(
+                        "This will also reverse its effect on your saved amount.",
+                        color="#FF6B6B", size=12,
+                    ),
+                ], tight=True, spacing=0),
+                actions=[
+                    ft.TextButton("Cancel", on_click=cancel,
+                                  style=ft.ButtonStyle(color={"": "#9090B0"})),
+                    ft.TextButton("Delete", on_click=do_delete,
+                                  style=ft.ButtonStyle(color={"": "#FF6B6B"})),
+                ],
+                bgcolor="#10101C",
+                shape=ft.RoundedRectangleBorder(radius=18),
+            )
+            page.overlay.append(dlg)
+            dlg.open = True
+            page.update()
+
+        # ── Notes dialog ─────────────────────────────────
         def open_notes_dialog(entry_index):
             entry = data["history"][entry_index]
             is_add = entry["action"] == "add"
@@ -304,6 +358,11 @@ def main(page: ft.Page):
             def close_dlg(ev):
                 dlg.open = False
                 page.update()
+
+            def on_delete(ev):
+                dlg.open = False
+                page.update()
+                confirm_delete_entry(entry_index)
 
             dlg = ft.AlertDialog(
                 modal=True,
@@ -337,9 +396,11 @@ def main(page: ft.Page):
                     note_edit,
                 ], tight=True, spacing=0),
                 actions=[
+                    ft.TextButton("Delete Entry", on_click=on_delete,
+                                  style=ft.ButtonStyle(color={"": "#FF6B6B"})),
                     ft.TextButton("Cancel", on_click=close_dlg,
                                   style=ft.ButtonStyle(color={"": "#9090B0"})),
-                    ft.TextButton("Save", on_click=save_note,
+                    ft.TextButton("Save Note", on_click=save_note,
                                   style=ft.ButtonStyle(color={"": "#7C6FFF"})),
                 ],
                 bgcolor="#10101C",
@@ -354,64 +415,121 @@ def main(page: ft.Page):
             is_add = h["action"] == "add"
             has_notes = bool(h.get("notes", "").strip())
 
+            # Swipe-reveal state
+            tile_offset = {"x": 0.0}
+            translate_ref = ft.Ref[ft.Container]()
+            delete_btn_ref = ft.Ref[ft.Container]()
+
             def on_long_press(e, i=idx):
                 open_notes_dialog(i)
 
+            def on_pan_update(e: ft.DragUpdateEvent, i=idx):
+                new_x = tile_offset["x"] + e.delta_x
+                # Only allow swiping left (negative x), max -80
+                new_x = max(min(new_x, 0), -80)
+                tile_offset["x"] = new_x
+                translate_ref.current.margin = ft.Margin(left=new_x, right=-new_x, top=0, bottom=0)
+                # Show delete button opacity based on swipe
+                delete_btn_ref.current.opacity = abs(new_x) / 80
+                page.update()
+
+            def on_pan_end(e, i=idx):
+                if tile_offset["x"] < -40:
+                    # Snap open
+                    tile_offset["x"] = -80
+                    translate_ref.current.margin = ft.Margin(left=-80, right=80, top=0, bottom=0)
+                    delete_btn_ref.current.opacity = 1.0
+                else:
+                    # Snap closed
+                    tile_offset["x"] = 0
+                    translate_ref.current.margin = ft.Margin(left=0, right=0, top=0, bottom=0)
+                    delete_btn_ref.current.opacity = 0.0
+                page.update()
+
+            def on_delete_tap(e, i=idx):
+                # Reset swipe first
+                tile_offset["x"] = 0
+                translate_ref.current.margin = ft.Margin(left=0, right=0, top=0, bottom=0)
+                delete_btn_ref.current.opacity = 0.0
+                page.update()
+                confirm_delete_entry(i)
+
+            tile_content = ft.Container(
+                ref=translate_ref,
+                bgcolor="#0E0E1A",
+                border_radius=12,
+                border=ft.Border.all(1, "#1A1A30"),
+                padding=ft.Padding(left=16, right=16, top=12, bottom=12),
+                margin=ft.Margin(left=0, right=0, top=0, bottom=0),
+                content=ft.Column([
+                    ft.Row([
+                        ft.Container(
+                            width=36, height=36,
+                            border_radius=10,
+                            bgcolor="#1C1C30" if is_add else "#1C0E0E",
+                            content=ft.Text(
+                                "+" if is_add else "−",
+                                size=20, color="#7C6FFF" if is_add else "#FF6B6B",
+                                text_align=ft.TextAlign.CENTER,
+                                weight=ft.FontWeight.W_700,
+                            ),
+                            alignment=ft.Alignment(0, 0),
+                        ),
+                        ft.Container(width=12),
+                        ft.Column([
+                            ft.Text(
+                                f"{'+' if is_add else '-'}{fmt(h['amount'], h['currency'])}",
+                                size=15,
+                                weight=ft.FontWeight.W_600,
+                                color="#7C6FFF" if is_add else "#FF6B6B",
+                            ),
+                            ft.Text(h["date"], size=11, color="#505078"),
+                        ], spacing=2, expand=True),
+                        ft.Container(
+                            content=ft.Text("📝", size=14) if has_notes else ft.Text(
+                                "hold", size=9, color="#2A2A45", italic=True,
+                            ),
+                            padding=ft.Padding(left=4, right=0, top=0, bottom=0),
+                        ),
+                    ], alignment=ft.MainAxisAlignment.START),
+                    ft.Container(
+                        visible=has_notes,
+                        padding=ft.Padding(left=48, right=0, top=4, bottom=0),
+                        content=ft.Text(
+                            h.get("notes", ""),
+                            size=12, color="#7070A0", italic=True,
+                            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                        ),
+                    ),
+                ], spacing=0),
+            )
+
+            delete_reveal = ft.Container(
+                ref=delete_btn_ref,
+                width=72,
+                bgcolor="#FF6B6B",
+                border_radius=ft.BorderRadius(top_left=0, top_right=12, bottom_left=0, bottom_right=12),
+                opacity=0.0,
+                alignment=ft.Alignment(0, 0),
+                content=ft.Column([
+                    ft.Icon(ft.Icons.DELETE_ROUNDED, color="#FFFFFF", size=20),
+                    ft.Text("Delete", size=10, color="#FFFFFF", weight=ft.FontWeight.W_600),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                   alignment=ft.MainAxisAlignment.CENTER, spacing=2),
+                on_click=lambda e, i=idx: on_delete_tap(e, i),
+            )
+
             return ft.GestureDetector(
                 on_long_press_start=on_long_press,
-                content=ft.Container(
-                    bgcolor="#0E0E1A",
-                    border_radius=12,
-                    border=ft.Border.all(1, "#1A1A30"),
-                    padding=ft.Padding(left=16, right=16, top=12, bottom=12),
-                    content=ft.Column([
-                        ft.Row([
-                            ft.Container(
-                                width=36, height=36,
-                                border_radius=10,
-                                bgcolor="#1C1C30" if is_add else "#1C0E0E",
-                                content=ft.Text(
-                                    "+" if is_add else "−",
-                                    size=20, color="#7C6FFF" if is_add else "#FF6B6B",
-                                    text_align=ft.TextAlign.CENTER,
-                                    weight=ft.FontWeight.W_700,
-                                ),
-                                alignment=ft.Alignment(0, 0),
-                            ),
-                            ft.Container(width=12),
-                            ft.Column([
-                                ft.Text(
-                                    f"{'+' if is_add else '-'}{fmt(h['amount'], h['currency'])}",
-                                    size=15,
-                                    weight=ft.FontWeight.W_600,
-                                    color="#7C6FFF" if is_add else "#FF6B6B",
-                                ),
-                                ft.Text(h["date"], size=11, color="#505078"),
-                            ], spacing=2, expand=True),
-                            # Notes indicator
-                            ft.Container(
-                                content=ft.Text("📝", size=14) if has_notes else ft.Text(
-                                    "hold", size=9, color="#2A2A45",
-                                    italic=True,
-                                ),
-                                padding=ft.Padding(left=4, right=0, top=0, bottom=0),
-                            ),
-                        ], alignment=ft.MainAxisAlignment.START),
-                        # Show note preview if exists
-                        ft.Container(
-                            visible=has_notes,
-                            padding=ft.Padding(left=48, right=0, top=4, bottom=0),
-                            content=ft.Text(
-                                h.get("notes", ""),
-                                size=12,
-                                color="#7070A0",
-                                italic=True,
-                                max_lines=2,
-                                overflow=ft.TextOverflow.ELLIPSIS,
-                            ),
-                        ),
-                    ], spacing=0),
-                ),
+                on_horizontal_drag_update=on_pan_update,
+                on_horizontal_drag_end=on_pan_end,
+                content=ft.Stack([
+                    ft.Row([
+                        ft.Container(expand=True),
+                        delete_reveal,
+                    ]),
+                    tile_content,
+                ]),
             )
 
         def refresh_history_ui():
@@ -520,7 +638,6 @@ def main(page: ft.Page):
         pct = progress_pct()
         remaining = max(data["target"] - data["saved"], 0)
 
-        # Build initial history tiles
         initial_history = []
         if not data["history"]:
             initial_history = [
@@ -554,7 +671,7 @@ def main(page: ft.Page):
                                         bgcolor="#1E1E35",
                                         border_radius=6,
                                         padding=ft.Padding(left=6, right=6, top=2, bottom=2),
-                                        content=ft.Text("v1.5", size=10, color="#7C6FFF"),
+                                        content=ft.Text("v1.6", size=10, color="#7C6FFF"),
                                     ),
                                 ], spacing=6),
                                 ft.Text(data["goal"], size=22, weight=ft.FontWeight.W_700,
@@ -648,7 +765,6 @@ def main(page: ft.Page):
                                     ft.Row([amount_field, ft.Container(width=8), input_cur_btn],
                                            alignment=ft.MainAxisAlignment.START),
                                     ft.Container(height=10),
-                                    # ── Notes input (v1.5) ──────
                                     notes_field,
                                     ft.Container(height=12),
                                     ft.Row([
@@ -704,8 +820,8 @@ def main(page: ft.Page):
                                     bgcolor="#1A1A2E",
                                     border_radius=8,
                                     padding=ft.Padding(left=8, right=8, top=3, bottom=3),
-                                    content=ft.Text("hold to add note", size=10, color="#505078",
-                                                     italic=True),
+                                    content=ft.Text("← swipe to delete  •  hold to note", size=10,
+                                                     color="#505078", italic=True),
                                 ),
                             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                             ft.Container(height=10),
